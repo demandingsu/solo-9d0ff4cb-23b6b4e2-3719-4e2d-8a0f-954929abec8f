@@ -13,6 +13,7 @@ class Settings:
     db_path: str = os.getenv("TENDER_DB_PATH", _DEFAULT_DB)
     request_timeout: float = float(os.getenv("TENDER_HTTP_TIMEOUT", "15"))
     max_list_pages: int = int(os.getenv("TENDER_MAX_LIST_PAGES", "200"))
+    fetch_concurrency: int = int(os.getenv("TENDER_FETCH_CONCURRENCY", "8"))
     user_agent: str = os.getenv(
         "TENDER_USER_AGENT", "TenderCollector/1.0 (+bid-deadline-monitor)"
     )

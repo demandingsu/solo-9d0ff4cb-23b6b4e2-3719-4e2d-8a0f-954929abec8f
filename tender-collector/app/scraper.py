@@ -3,13 +3,14 @@
 流程：
 1. 从用户提交的列表页开始，沿分页链接抓取全部列表页（去重、防环、限量）；
 2. 收集列表页中全部详情页链接（同源、去重）；
-3. 逐页抓取详情并解析为结构化公告。
+3. 并行抓取详情并解析为结构化公告（同一入口的页面抓取彼此独立，可并行）。
 
 任一列表页或详情页读取失败（网络错误、非 2xx、HTML 缺关键字段）都抛出
 CollectionError，由上层整体放弃本次采集，数据库保留上次成功结果。
 """
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -139,6 +140,32 @@ def _parse_detail(html_text: str, detail_url: str) -> ParsedAnnouncement:
     )
 
 
+def _crawl_list_pages(client: httpx.Client, list_url: str) -> set[str]:
+    """遍历全部列表页，返回去重后的详情页链接集合。"""
+    seen_pages: set[str] = set()
+    queue: list[str] = [list_url]
+    detail_urls: set[str] = set()
+
+    while queue:
+        if len(seen_pages) >= settings.max_list_pages:
+            raise CollectionError(
+                f"列表页数量超过上限 {settings.max_list_pages}，疑似分页环"
+            )
+        page_url = queue.pop(0)
+        if page_url in seen_pages:
+            continue
+        seen_pages.add(page_url)
+
+        html_text = _get(client, page_url)
+        details, more_pages = _parse_list(html_text, page_url)
+        detail_urls.update(details)
+        for u in more_pages:
+            if u not in seen_pages and u not in queue:
+                queue.append(u)
+
+    return detail_urls
+
+
 def collect(list_url: str) -> list[dict[str, Any]]:
     """抓取整个公告站并返回结构化公告列表（顺序不保证，归并层不依赖顺序）。"""
     headers = {"User-Agent": settings.user_agent}
@@ -146,31 +173,31 @@ def collect(list_url: str) -> list[dict[str, Any]]:
         timeout=settings.request_timeout, follow_redirects=True, headers=headers
     ) as client:
         # 1) 遍历全部列表页
-        seen_pages: set[str] = set()
-        queue: list[str] = [list_url]
-        detail_urls: set[str] = set()
+        detail_urls = _crawl_list_pages(client, list_url)
 
-        while queue:
-            if len(seen_pages) >= settings.max_list_pages:
-                raise CollectionError(
-                    f"列表页数量超过上限 {settings.max_list_pages}，疑似分页环"
-                )
-            page_url = queue.pop(0)
-            if page_url in seen_pages:
-                continue
-            seen_pages.add(page_url)
-
-            html_text = _get(client, page_url)
-            details, more_pages = _parse_list(html_text, page_url)
-            detail_urls.update(details)
-            for u in more_pages:
-                if u not in seen_pages and u not in queue:
-                    queue.append(u)
-
-        # 2) 逐页抓取详情 —— 任一失败即整体失败
+        # 2) 并行抓取详情 —— 任一失败即整体失败（取消尚未完成的任务）
         announcements: list[dict[str, Any]] = []
-        for detail_url in sorted(detail_urls):  # 排序仅为日志/测试的确定性
-            html_text = _get(client, detail_url)
-            announcements.append(_parse_detail(html_text, detail_url).as_dict())
+        urls = sorted(detail_urls)  # 排序仅为日志/测试的确定性
+        if not urls:
+            return announcements
+        workers = max(1, min(settings.fetch_concurrency, len(urls)))
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="tender-detail"
+        ) as pool:
+            futures: dict[Future, str] = {
+                pool.submit(_get, client, detail_url): detail_url
+                for detail_url in urls
+            }
+            try:
+                for fut in as_completed(futures):
+                    detail_url = futures[fut]
+                    html_text = fut.result()
+                    announcements.append(
+                        _parse_detail(html_text, detail_url).as_dict()
+                    )
+            except CollectionError:
+                for pending in futures:
+                    pending.cancel()
+                raise
 
     return announcements

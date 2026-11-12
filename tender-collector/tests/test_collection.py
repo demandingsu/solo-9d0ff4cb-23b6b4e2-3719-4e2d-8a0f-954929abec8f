@@ -1,74 +1,13 @@
-"""端到端测试：用线程内静态 HTTP 服务器托管生成的示例公告站，
+"""端到端测试：用线程内可控 HTTP 服务器托管示例公告站，
 通过 FastAPI TestClient 走完整的采集/查询/失败保留流程。
 """
 from __future__ import annotations
 
-import functools
-import http.server
-import importlib.util
-import sys
-import threading
 from datetime import datetime
-from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-ROOT = Path(__file__).resolve().parent.parent
-DEMO_DIR = ROOT / "demo_site"
-
-# 加载示例数据生成器（脚本名带连字符，用 importlib）
-spec = importlib.util.spec_from_file_location(
-    "generate_demo_site", ROOT / "scripts" / "generate_demo_site.py"
-)
-gen = importlib.util.module_from_spec(spec)
-sys.modules["generate_demo_site"] = gen
-spec.loader.exec_module(gen)
-
-
-# ---------------------------------------------------------------------------
-# 静态文件服务器（支持可选的故障注入）
-# ---------------------------------------------------------------------------
-class FlakyHandler(http.server.SimpleHTTPRequestHandler):
-    # 类属性：需要返回 404 的路径集合
-    fail_paths: set[str] = set()
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(DEMO_DIR), **kwargs)
-
-    def do_GET(self):  # noqa: N802
-        if self.path in self.fail_paths:
-            self.send_error(404, "injected failure")
-            return
-        return super().do_GET()
-
-    def log_message(self, *args):  # 静默
-        pass
-
-
-@pytest.fixture(scope="session")
-def demo_server():
-    handler = functools.partial(FlakyHandler)
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    host, port = httpd.server_address
-    yield f"http://{host}:{port}", httpd, FlakyHandler
-    httpd.shutdown()
-
-
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    # 每个测试使用独立临时数据库
-    monkeypatch.setenv("TENDER_DB_PATH", str(tmp_path / "test.db"))
-    from app import config, database
-    importlib.reload(config)
-    import app.main as main
-    importlib.reload(database)
-    importlib.reload(main)
-    database.init_db()
-    with TestClient(main.app) as c:
-        yield c, main, database
+from conftest import gen
 
 
 # ---------------------------------------------------------------------------
@@ -89,9 +28,11 @@ def project_map(payload):
 # ---------------------------------------------------------------------------
 def test_full_collection_and_deadline_resolution(client, demo_server):
     c, main, _ = client
-    base, _, _ = demo_server
+    base, control = demo_server
     payload = collect(c, base)
     assert payload["collected"] == 10
+    assert payload["published"] is True
+    assert payload["status"] == "success"
 
     projects = project_map(payload)
     assert set(projects) == {a.project_name for a in gen.ANNOUNCEMENTS}
@@ -152,7 +93,7 @@ def test_order_independence():
 
 def test_duplicate_collection_creates_no_duplicates(client, demo_server):
     c, main, database = client
-    base, _, _ = demo_server
+    base, _ = demo_server
     collect(c, base)
     collect(c, base)  # 重复采集
 
@@ -162,9 +103,13 @@ def test_duplicate_collection_creates_no_duplicates(client, demo_server):
             "SELECT COUNT(DISTINCT code) FROM announcements"
         ).fetchone()[0]
         runs = conn.execute("SELECT COUNT(*) FROM collection_runs").fetchone()[0]
+        published_runs = conn.execute(
+            "SELECT COUNT(*) FROM collection_runs WHERE published = 1"
+        ).fetchone()[0]
     assert total == 10
     assert distinct == 10
     assert runs == 2
+    assert published_runs == 2
 
     # 查询接口仍然是 5 个项目
     resp = c.get("/api/projects")
@@ -174,14 +119,14 @@ def test_duplicate_collection_creates_no_duplicates(client, demo_server):
 
 def test_detail_failure_keeps_last_successful_result(client, demo_server):
     c, main, database = client
-    base, httpd, handler = demo_server
+    base, control = demo_server
 
     # 首次成功采集
     first = collect(c, base)
     assert first["collected"] == 10
 
     # 注入故障：某个详情页 404
-    handler.fail_paths = {"/SZ-2026-002-G2.html"}
+    control.fail("/SZ-2026-002-G2.html", status=404)
     try:
         resp = c.post(
             "/api/collect", json={"list_url": f"{base}/list_1.html"}
@@ -189,7 +134,7 @@ def test_detail_failure_keeps_last_successful_result(client, demo_server):
         assert resp.status_code == 422
         assert "SZ-2026-002-G2" in resp.json()["detail"] or "HTTP 404" in resp.json()["detail"]
     finally:
-        handler.fail_paths = set()
+        control.reset()
 
     # 上次成功采集的完整结果必须保留
     resp = c.get("/api/projects")
@@ -204,6 +149,8 @@ def test_detail_failure_keeps_last_successful_result(client, demo_server):
     runs = c.get("/api/collections").json()
     statuses = [r["status"] for r in runs]
     assert "failed" in statuses and "success" in statuses
+    failed = next(r for r in runs if r["status"] == "failed")
+    assert failed["published"] == 0
 
     again = collect(c, base)
     assert again["collected"] == 10
@@ -211,10 +158,10 @@ def test_detail_failure_keeps_last_successful_result(client, demo_server):
 
 def test_list_page_failure_returns_error(client, demo_server):
     c, main, database = client
-    base, httpd, handler = demo_server
+    base, control = demo_server
     collect(c, base)
 
-    handler.fail_paths = {"/list_2.html"}
+    control.fail("/list_2.html", status=404)
     try:
         resp = c.post(
             "/api/collect", json={"list_url": f"{base}/list_1.html"}
@@ -222,7 +169,7 @@ def test_list_page_failure_returns_error(client, demo_server):
         assert resp.status_code == 422
         assert "list_2" in resp.json()["detail"]
     finally:
-        handler.fail_paths = set()
+        control.reset()
 
     # 数据仍是上次成功的 10 条
     with database.get_conn() as conn:
@@ -249,7 +196,7 @@ def test_expired_flag_uses_fixed_now(client, demo_server):
     from app import service
 
     c, main, _ = client
-    base, _, _ = demo_server
+    base, _ = demo_server
     collect(c, base)
 
     fixed_now = datetime(2026, 11, 26, 0, 0)

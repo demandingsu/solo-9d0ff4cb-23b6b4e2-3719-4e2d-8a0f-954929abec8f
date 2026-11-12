@@ -20,15 +20,30 @@ class ProjectOut(BaseModel):
 class CollectResponse(BaseModel):
     status: str
     source_url: str
+    run_id: int
+    seq: int
+    published: bool
+    published_run_id: int
     collected: int
     projects: list[ProjectOut]
+    started_at: str
+    finished_at: str | None = None
 
 
 class RunOut(BaseModel):
     id: int
+    seq: int
     source_url: str
     status: str
+    published: bool
     items_collected: int
     error: str | None
     started_at: str
-    finished_at: str
+    finished_at: str | None
+
+
+class SourceStateOut(BaseModel):
+    source_url: str
+    published_run_id: int
+    published_seq: int
+    published_at: str

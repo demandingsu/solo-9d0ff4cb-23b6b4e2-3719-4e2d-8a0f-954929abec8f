@@ -5,20 +5,48 @@ services:
     environment:
       TENDER_DB_PATH: /data/tenders.db
       TENDER_HTTP_TIMEOUT: "15"
+      TENDER_FETCH_CONCURRENCY: "8"
     ports:
       - "8000:8000"
     volumes:
       - tender-data:/data
     restart: unless-stopped
 
-  # 本地分页 HTML 示例公告站（纯静态文件，nginx 托管）
+  # 本地可控示例公告站：托管 demo_site/，并提供 /__control 慢页/故障页接口
+  # 容器内监听 8100（与 nginx 默认 80 区分）；容器名 demo-site 即服务名，
+  # API 采集地址使用 http://demo-site:8100/list_1.html，宿主机浏览用 :8001
   demo-site:
-    image: nginx:1.27-alpine
+    build: .
     container_name: tender-demo-site
-    ports:
-      - "8001:80"
+    command:
+      - python
+      - -m
+      - app.demo_server
+      - --directory
+      - /demo_site
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8100"
+      - --base-url
+      - http://demo-site:8100
+    environment:
+      PYTHONUNBUFFERED: "1"
     volumes:
-      - ./demo_site:/usr/share/nginx/html:ro
+      - ./demo_site:/demo_site:ro
+    ports:
+      - "8001:8100"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request
+          urllib.request.urlopen("http://127.0.0.1:8100/list_1.html", timeout=3)
+      interval: 15s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
 volumes:

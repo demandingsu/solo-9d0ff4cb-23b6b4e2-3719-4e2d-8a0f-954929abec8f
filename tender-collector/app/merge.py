@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 
@@ -23,6 +23,7 @@ class EffectiveDeadline:
     deadline: str
     source_code: str
     source_url: str
+    announce_codes: tuple[str, ...] = field(default_factory=tuple)
 
 
 def _sort_key(row: dict[str, Any]) -> tuple[str, str]:
@@ -73,6 +74,7 @@ def merge_projects(rows: Iterable[dict[str, Any]]) -> list[EffectiveDeadline]:
                 deadline=source["deadline"],
                 source_code=source["code"],
                 source_url=source["detail_url"],
+                announce_codes=tuple(r["code"] for r in ordered),
             )
         )
 
